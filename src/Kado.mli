@@ -16,3 +16,4 @@ module Theory : module type of Theory
 (**/**)
 
 module Graph : module type of Graph
+module DGraph : module type of DGraph

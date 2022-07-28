@@ -3,6 +3,7 @@ module type Param =
 sig
   (** The interval algebra. *)
   type dim
+  type ddim
 
   (** The type of cofibration variables. *)
   type var
@@ -13,8 +14,12 @@ sig
   (** The element 1 in the interval algebra. *)
   val dim1 : dim
 
+  val ddim0 : ddim
+  val ddim1 : ddim
+
   (** Comparator for elements of the interval algebra. *)
   val compare_dim : dim -> dim -> int
+  val compare_ddim : ddim -> ddim -> int
 
   (** Comparator for cofibration variables. *)
   val compare_var : var -> var -> int
@@ -26,12 +31,13 @@ sig
 
   (** The type of dimensions. *)
   type dim
+  type ddim
 
   (** The type of cofibration variables. *)
   type var
 
   (** The type of cofibrations. *)
-  type cof = (dim, var) Syntax.free
+  type cof = (dim, ddim, var) Syntax.free
 
   (** The type of an algebraic theory (no unreduced joins). *)
   type alg_thy
@@ -100,6 +106,7 @@ sig
         Also, [r] cannot be [dim0] or [dim1].
     *)
     val forall_cof : t -> dim * cof -> cof
+    val dforall_cof : t -> ddim * cof -> cof
 
     (** [meet2 thy1 thy2] computes the conjunction of the two theories [thy1] and [thy2].
         This is useful for supporting compilation units with top-level cofibration declarations. *)
@@ -108,4 +115,4 @@ sig
 end
 
 (** The cofibration solver. *)
-module Make (P : Param) : S with type dim = P.dim and type var = P.var
+module Make (P : Param) : S with type dim = P.dim and type ddim = P.ddim and type var = P.var

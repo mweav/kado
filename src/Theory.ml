@@ -4,18 +4,23 @@ open Bwd
 module type Param =
 sig
   type dim
+  type ddim
   type var
   val dim0 : dim
   val dim1 : dim
+  val ddim0 : ddim
+  val ddim1 : ddim
   val compare_dim : dim -> dim -> int
+  val compare_ddim : ddim -> ddim -> int
   val compare_var : var -> var -> int
 end
 
 module type S =
 sig
   type dim
+  type ddim
   type var
-  type cof = (dim, var) Syntax.free
+  type cof = (dim, ddim, var) Syntax.free
   type alg_thy
   type disj_thy
 
@@ -39,17 +44,18 @@ sig
     val decompose : t -> Alg.t list
     val simplify_cof : t -> cof -> cof
     val forall_cof : t -> dim * cof -> cof
+    val dforall_cof : t -> ddim * cof -> cof
     val meet2 : t -> t -> t
   end
 end
 
-module Make (P : Param) : S with type dim = P.dim and type var = P.var =
+module Make (P : Param) : S with type dim = P.dim and type ddim = P.ddim and type var = P.var =
 struct
   include P
 
   open Syntax
 
-  type cof = (dim, var) free
+  type cof = (dim, ddim, var) free
 
   module Graph = Graph.Make (struct
       type t = dim
@@ -57,17 +63,26 @@ struct
       let initial = dim0
       let terminal = dim1
     end)
+  module DGraph = DGraph.Make (struct
+      type t = ddim
+      let compare = compare_ddim
+      let initial = ddim0
+      let terminal = ddim1
+    end)
   module VarSet = Set.Make (struct type t = var let compare = compare_var end)
-  module B = Builder.Free.Make (struct include P let equal_dim x y = Int.equal (compare_dim x y) 0 end)
+  module B = Builder.Free.Make (struct include P 
+    let equal_dim x y = Int.equal (compare_dim x y) 0 
+    let equal_ddim x y = Int.equal (compare_ddim x y) 0  end)
 
   (** A presentation of an algebraic theory over the language of intervals and cofibrations. *)
   type alg_thy' =
-    { le : Graph.t; true_vars : VarSet.t }
+    { le : Graph.t; dle : DGraph.t; true_vars : VarSet.t }
 
   type le = dim * dim
+  type dle = ddim * ddim
 
   (** A [branch] represents the meet of a bunch of atomic cofibrations. *)
-  type branch = VarSet.t * le list
+  type branch = VarSet.t * le list * dle list
   type branches = branch list
 
   (** A [cached_branch] is a [branch] together with an algebraic theory
@@ -92,12 +107,12 @@ struct
   *)
   let rec dissect_cofibrations : cof list -> branches =
     function
-    | [] -> [VarSet.empty, []]
+    | [] -> [VarSet.empty, [], []]
     | cof :: cofs ->
       match cof with
       | Var v ->
         List.map (dissect_cofibrations cofs)
-          ~f:(fun (vars, eqs) -> VarSet.add v vars, eqs)
+          ~f:(fun (vars, eqs, deqs) -> VarSet.add v vars, eqs, deqs)
       | Cof cof ->
         match cof with
         | Meet meet_cofs ->
@@ -107,7 +122,10 @@ struct
             ~f:(fun join_cof -> dissect_cofibrations @@ join_cof :: cofs)
         | Le (r, s) ->
           List.map (dissect_cofibrations cofs)
-            ~f:(fun (vars, eqs) -> vars, (r, s) :: eqs)
+            ~f:(fun (vars, eqs, deqs) -> vars, (r, s) :: eqs, deqs)
+        | DLe (r, s) ->
+          List.map (dissect_cofibrations cofs)
+            ~f:(fun (vars, eqs, deqs) -> vars, eqs, (r, s) :: deqs)
 
   module Alg =
   struct
@@ -116,6 +134,7 @@ struct
 
     let emp' =
       {le = Graph.empty;
+       dle = DGraph.empty;
        true_vars = VarSet.empty}
 
     let empty =
@@ -132,13 +151,20 @@ struct
     let test_le (thy : t') (r, s) =
       Graph.test r s thy.le
 
-    let test_inconsistent (thy' : t') = test_le thy' (P.dim1, P.dim0)
+    let test_dle (thy : t') (r, s) =
+      DGraph.test r s thy.dle
+
+    let test_inconsistent (thy' : t') = (test_le thy' (P.dim1, P.dim0)) || (test_dle thy' (P.ddim1, P.ddim0))
 
     (** [unsafe_test_and_assume_eq] fuses [test_eq] and [assume_eq] (if there was one).
       * It is "unsafe" because we do not check consistency here. *)
     let unsafe_test_and_assume_le (thy : t') (r, s) =
       let testing, le = Graph.test_and_union r s thy.le in
       testing, {thy with le}
+
+    let unsafe_test_and_assume_dle (thy : t') (r, s) =
+      let testing, dle = DGraph.test_and_union r s thy.dle in
+      testing, {thy with dle = dle}
 
     let tri_test_le thy (x, y) =
       match unsafe_test_and_assume_le thy (x, y) with
@@ -149,8 +175,20 @@ struct
         else
           `Indeterminate
 
+    let tri_test_dle thy (x, y) =
+      match unsafe_test_and_assume_dle thy (x, y) with
+      | true, _ -> `True
+      | false, thy' ->
+        if test_inconsistent thy' then
+          `False
+        else
+          `Indeterminate
+
     let test_les (thy : t') les =
       List.for_all ~f:(test_le thy) les
+
+    let test_dles (thy : t') dles =
+      List.for_all ~f:(test_dle thy) dles
 
     let test_var (thy : t') v =
       VarSet.mem v thy.true_vars
@@ -158,8 +196,8 @@ struct
     let test_vars (thy : t') vs =
       VarSet.subset vs thy.true_vars
 
-    let test_branch (thy : t') (vars, les) =
-      test_vars thy vars && test_les thy les
+    let test_branch (thy : t') (vars, les, dles) =
+      test_vars thy vars && test_les thy les && test_dles thy dles
 
     (** [reduced_vars] takes out redundant cofibration variables. *)
     let reduce_vars (thy : t') vars =
@@ -167,24 +205,30 @@ struct
 
     (** [reduce_les] detects inconsistency of an inequality set and takes out
       * redundant inequalities. *)
-    let reduce_les (thy : t') les =
-      let go ((thy', les) as acc) le =
+    let reduce_les (thy : t') les dles =
+      let go ((thy', les, dles) as acc) le =
         match unsafe_test_and_assume_le thy' le with
         | true, _ -> acc
-        | false, thy' -> thy', Snoc (les, le)
+        | false, thy' -> thy', Snoc (les, le), dles
       in
-      let thy', les = List.fold_left ~f:go ~init:(thy, Emp) les in
-      match test_inconsistent thy' with
+      let dgo ((thy', les, dles) as acc) dle =
+        match unsafe_test_and_assume_dle thy' dle with
+        | true, _ -> acc
+        | false, thy' -> thy', les, Snoc (dles, dle)
+      in
+      let thy', les, _ = List.fold_left ~f:go ~init:(thy, Emp, Emp) les in
+      let thy'', _, dles = List.fold_left ~f:dgo ~init:(thy', Emp, Emp) dles in 
+      match test_inconsistent thy'' with
       | true -> `Inconsistent
-      | false -> `Consistent (thy', BwdLabels.to_list les)
+      | false -> `Consistent (thy'', BwdLabels.to_list les, BwdLabels.to_list dles)
 
     (** [reduce_branch] detects inconsistency of a branch and takes out redundant
       * cofibration variables and inequalities. *)
-    let reduce_branch (thy' : t') (vars, les) =
-      match reduce_les thy' les with
+    let reduce_branch (thy' : t') (vars, les, dles) =
+      match reduce_les thy' les dles with
       | `Inconsistent -> `Inconsistent
-      | `Consistent (thy', les) ->
-        `Consistent (assume_vars thy' vars, (reduce_vars thy' vars, les))
+      | `Consistent (thy', les, dles) ->
+        `Consistent (assume_vars thy' vars, (reduce_vars thy' vars, les, dles))
 
     (** [reduce_branches] removes inconsistent branches and takes out redundant
       * cofibration variables and inequalities. *)
@@ -222,7 +266,7 @@ struct
       | `Consistent thy' ->
         match dissect_cofibrations cofs with
         | [] -> []
-        | [vars, []] when VarSet.is_empty vars -> [`Consistent thy']
+        | [vars, [], []] when VarSet.is_empty vars -> [`Consistent thy']
         | dissected_cofs ->
           List.map ~f:(fun (thy', _) -> `Consistent thy') @@
           drop_useless_branches @@
@@ -233,6 +277,8 @@ struct
       function
       | Cof Le (r, s) ->
         test_le thy' (r, s)
+      | Cof DLe (r, s) ->
+        test_dle thy' (r, s)
       | Cof Join phis ->
         List.exists ~f:(test thy') phis
       | Cof Meet phis ->
@@ -244,6 +290,7 @@ struct
     let meet2' thy'1 thy'2 =
       let thy' =
         {le = Graph.merge thy'1.le thy'2.le;
+         dle = DGraph.merge thy'1.dle thy'2.dle; 
          true_vars = VarSet.union thy'1.true_vars thy'2.true_vars}
       in
       match test_inconsistent thy' with
@@ -263,14 +310,14 @@ struct
     type t = disj_thy
 
     let envelop_alg' alg_thy' : disj_thy =
-      [alg_thy', (VarSet.empty, [])]
+      [alg_thy', (VarSet.empty, [], [])]
 
     let envelope_alg =
       function
       | `Consistent alg_thy' -> envelop_alg' alg_thy'
       | `Inconsistent -> []
 
-    let empty : t = [Alg.emp', (VarSet.empty, [])]
+    let empty : t = [Alg.emp', (VarSet.empty, [], [])]
 
     let consistency =
       function
@@ -287,10 +334,10 @@ struct
     *)
     let refactor_branches cached_branches : t =
       let common_vars =
-        let go vars0 (_, (vars1, _)) = VarSet.inter vars0 vars1 in
+        let go vars0 (_, (vars1, _, _)) = VarSet.inter vars0 vars1 in
         match cached_branches with
         | [] -> VarSet.empty
-        | (_, (vars, _)) :: branches -> List.fold_left ~f:go ~init:vars branches
+        | (_, (vars, _, _)) :: branches -> List.fold_left ~f:go ~init:vars branches
       in
       (* The following is checking whether individual inequalities are useful (not shared
        * by all the algebraic theories). It does not kill every "useless" equation where
@@ -314,9 +361,13 @@ struct
         List.exists cached_branches
           ~f:(fun (thy', _) -> not @@ Alg.test_le thy' le)
       in
+      let duseful dle =
+        List.exists cached_branches
+          ~f:(fun (thy', _) -> not @@ Alg.test_dle thy' dle)
+      in
       (* revisit all branches and remove all useless ones identified by the simple criterion above. *)
       List.map cached_branches
-        ~f:(fun (thy', (vars, eqs)) -> thy', (VarSet.diff vars common_vars, List.filter ~f:useful eqs))
+        ~f:(fun (thy', (vars, eqs, deqs)) -> thy', (VarSet.diff vars common_vars, List.filter ~f:useful eqs, List.filter ~f:duseful deqs))
 
     (** [split thy cofs] adds to the theory [thy] the conjunction of a list of cofibrations [cofs]
       * and calculate the branches accordingly. This is similar to [Alg.split] in the spirit but
@@ -324,14 +375,14 @@ struct
     let split (thy : t) (cofs : cof list) : t =
       match dissect_cofibrations cofs with
       | [] -> []
-      | [vars, []] when VarSet.is_empty vars -> thy
+      | [vars, [], []] when VarSet.is_empty vars -> thy
       | dissected_cofs ->
         Alg.drop_useless_branches @@
         List.concat_map thy
-          ~f:(fun (thy', (vars, eq)) ->
+          ~f:(fun (thy', (vars, eq, deq)) ->
               List.map (Alg.reduce_branches thy' dissected_cofs)
-                ~f:(fun (thy', (sub_vars, sub_eqs)) ->
-                    thy', (VarSet.union vars sub_vars, eq @ sub_eqs)))
+                ~f:(fun (thy', (sub_vars, sub_eqs, sub_deqs)) ->
+                    thy', (VarSet.union vars sub_vars, eq @ sub_eqs, deq @ sub_deqs)))
 
     (** [assume thy cofs] is the same as [split thy cofs] except that it further refactors the
       * branches to optimize future searching. *)
@@ -347,7 +398,11 @@ struct
 
     let test_le thy le = List.for_all thy ~f:(fun (thy', _) -> Alg.test_le thy' le)
 
+    let test_dle thy dle = List.for_all thy ~f:(fun (thy', _) -> Alg.test_dle thy' dle)
+
     let test_eq thy (x, y) = test_le thy (x, y) && test_le thy (y, x)
+
+    let test_deq thy (x, y) = test_dle thy (x, y) && test_dle thy (y, x)
 
     (* XXX: this function was never profiled *)
     let tri_test_le thy (x, y) =
@@ -365,6 +420,21 @@ struct
       | _, false, false -> `True
       | false, false, _ -> `False
 
+    let tri_test_dle thy (x, y) =
+      let has_true = ref false in
+      let has_indet = ref false in
+      let has_false = ref false in
+      let () = List.iter thy ~f:(fun (thy', _) ->
+          match Alg.tri_test_dle thy' (x, y) with
+          | `True -> has_true := true
+          | `False -> has_false := true
+          | `Indeterminate -> has_indet := true)
+      in
+      match !has_true, !has_indet, !has_false with
+      | _, true, _ | true, _, true -> `Indeterminate
+      | _, false, false -> `True
+      | false, false, _ -> `False
+
     (* XXX: this function was never profiled *)
     let simplify_cof thy cof =
       let simplify_le (x, y) =
@@ -372,6 +442,12 @@ struct
         | `True -> Free.top
         | `False -> Free.bot
         | `Indeterminate -> Free.le x y
+      in
+      let simplify_dle (x, y) =
+        match tri_test_dle thy (x, y) with
+        | `True -> Free.top
+        | `False -> Free.bot
+        | `Indeterminate -> Free.dle x y
       in
       let simplify_var v =
         if List.for_all thy ~f:(fun (thy', _) -> Alg.test_var thy' v) then
@@ -383,6 +459,8 @@ struct
         function
         | Cof Le (x, y) ->
           simplify_le (x, y)
+        | Cof DLe (x, y) ->
+          simplify_dle (x, y)
         | Var v ->
           simplify_var v
         | Cof Join phis ->
@@ -405,6 +483,30 @@ struct
         function
         | Cof Le (x, y) ->
           forall_le (x, y)
+        | Cof DLe (x, y) ->
+          Cof (DLe (x, y))
+        | Var v -> Var v
+        | Cof Join phis ->
+          B.join @@ List.map ~f:go phis
+        | Cof Meet phis ->
+          B.meet @@ List.map ~f:go phis
+      in
+      go cof
+
+    let dforall_cof thy (sym, cof) =
+      let forall_dle (x, y) =
+        match test_deq thy (x, sym), test_deq thy (y, sym) with
+        | true, true -> Free.top
+        | true, false -> if test_dle thy (ddim1, y) then Free.top else Free.bot
+        | false, true -> if test_dle thy (x, ddim0) then Free.top else Free.bot
+        | _ -> Free.dle x y
+      in
+      let rec go =
+        function
+        | Cof Le (x, y) ->
+          Cof (Le (x, y))
+        | Cof DLe (x, y) ->
+          forall_dle (x, y)
         | Var v -> Var v
         | Cof Join phis ->
           B.join @@ List.map ~f:go phis
@@ -418,12 +520,12 @@ struct
       (* a correct but unoptimized theory *)
       let draft =
         List.concat_map thy1
-          ~f:(fun (thy'1, (vars1, eqs1)) ->
+          ~f:(fun (thy'1, (vars1, eqs1, deqs1)) ->
               List.filter_map thy2
-                ~f:(fun (thy'2, (vars2, eqs2)) ->
+                ~f:(fun (thy'2, (vars2, eqs2, deqs2)) ->
                     match Alg.meet2' thy'1 thy'2 with
                     | `Inconsistent -> None
-                    | `Consistent thy' -> Some (thy', (VarSet.union vars1 vars2, eqs1 @ eqs2))))
+                    | `Consistent thy' -> Some (thy', (VarSet.union vars1 vars2, eqs1 @ eqs2, deqs1 @ deqs2))))
       in
       (* potentially expensive optimization *)
       refactor_branches @@ Alg.drop_useless_branches draft

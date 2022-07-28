@@ -5,3 +5,5 @@ module Builder = Builder
 module Theory = Theory
 
 module Graph = Graph
+
+module DGraph = DGraph
